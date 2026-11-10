@@ -368,11 +368,7 @@ pub const LoadingImage = struct {
 
         // Open our file right away before we do validation. This avoids
         // TOCTOU issues.
-        var file = std.Io.Dir.cwd().openFile(
-            io,
-            path,
-            .{},
-        ) catch |err| {
+        var file = openFileNonblocking(io, path) catch |err| {
             log.warn("failed to open image file: {}", .{err});
             return error.InvalidData;
         };
@@ -467,6 +463,35 @@ pub const LoadingImage = struct {
         // Set our data
         assert(self.data.items.len == 0);
         self.data = .{ .items = managed.items, .capacity = managed.capacity };
+    }
+
+    /// Opens a client-supplied image path for reading without blocking.
+    ///
+    /// The path is attacker controlled and is only validated after it is
+    /// opened (see readFile). A blocking open(2) of a FIFO waits for a
+    /// writer, and a blocking open of a serial call-in device waits for
+    /// carrier, so either would stall the thread feeding the terminal.
+    /// O_NONBLOCK makes those opens return immediately so validation can
+    /// reject them, and O_NOCTTY keeps a terminal device from becoming our
+    /// controlling terminal.
+    ///
+    /// O_NONBLOCK is left set because readFile only reads after verifying
+    /// the handle is a regular file, and reads of regular files ignore
+    /// O_NONBLOCK on the platforms this path supports.
+    fn openFileNonblocking(io: std.Io, path: []const u8) !std.Io.File {
+        const posix_open = switch (builtin.target.os.tag) {
+            .windows, .wasi => false,
+            else => @hasDecl(posix.system, "openat"),
+        };
+        if (comptime !posix_open) return std.Io.Dir.cwd().openFile(io, path, .{});
+
+        const fd = try posix.openat(posix.AT.FDCWD, path, .{
+            .ACCMODE = .RDONLY,
+            .NONBLOCK = true,
+            .NOCTTY = true,
+            .CLOEXEC = true,
+        }, 0);
+        return .{ .handle = fd, .flags = .{ .nonblocking = true } };
     }
 
     /// Returns the canonical path of an open file after applying the file
@@ -1626,6 +1651,61 @@ test "image load: blocklist applies to opened file after symlink swap" {
     const safe_file = try tmp_dir.dir.openFile(io, "image.data", .{});
     defer safe_file.close(io);
     _ = try LoadingImage.validatedFilePath(io, safe_file, &path_buf);
+}
+
+test "image load: FIFO is rejected without blocking" {
+    if (comptime builtin.target.abi.isAndroid() or
+        builtin.target.os.tag == .windows or
+        !builtin.link_libc)
+    {
+        return error.SkipZigTest;
+    }
+
+    const c = struct {
+        extern "c" fn mkfifoat(
+            dirfd: posix.fd_t,
+            path: [*:0]const u8,
+            mode: posix.mode_t,
+        ) c_int;
+    };
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try testing.expectEqual(
+        posix.E.SUCCESS,
+        posix.errno(c.mkfifoat(tmp_dir.dir.handle, "image.fifo", 0o600)),
+    );
+
+    // Nothing ever opens the FIFO for writing, so a blocking open
+    // would hang this test forever.
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .file,
+            .compression = .none,
+            .width = 1,
+            .height = 1,
+            .image_id = 31,
+        } },
+        .data = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{s}/image.fifo",
+            .{tmp_dir.sub_path},
+        ),
+    };
+    defer cmd.deinit(alloc);
+    try testing.expectError(
+        error.InvalidData,
+        LoadingImage.init(io, alloc, &cmd, .{
+            .file = true,
+            .temporary_file = .disabled,
+            .shared_memory = false,
+        }),
+    );
 }
 
 test "image load: windows UNC path is rejected before open" {
